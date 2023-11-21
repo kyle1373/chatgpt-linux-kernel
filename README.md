@@ -1,6 +1,6 @@
 # ChatGPT Kernel
 
-This is a repository containing all of the files that the chatgpt interface has on https://chat.openai.com/. It runs a linux kernel. It's speculated that most of these folders are just normal linux files, but some may contain interesting source code (notably the `home` directory).  
+This is a repository containing all of the files that the chatgpt interface has on https://chat.openai.com. It runs a linux kernel. It's speculated that most of these folders are just normal linux files, but some may contain interesting source code (notably the `home` directory).  
 
 Directory progress:  
 
