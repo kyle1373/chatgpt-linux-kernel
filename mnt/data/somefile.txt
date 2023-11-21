@@ -1,0 +1,1 @@
+This file doesn't actually exist, but the directory does (hence why I created this file in `mnt/data`). When a user uploads a file, it gets put here.
