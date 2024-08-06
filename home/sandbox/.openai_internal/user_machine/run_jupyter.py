@@ -24,10 +24,12 @@ async def async_run_code(
     km: jupyter_client.AsyncKernelManager,
     code,
     *,
-    interrupt_after=10,
-    iopub_timeout=15,
+    interrupt_after=30,
+    iopub_timeout=40,
+    wait_for_ready_timeout=30,
     shutdown_kernel=True,
 ):
+    assert iopub_timeout > interrupt_after
     try:
 
         async def get_iopub_msg_with_death_detection(
@@ -74,7 +76,7 @@ async def async_run_code(
             assert isinstance(kc, jupyter_client.AsyncKernelClient)
             kc.start_channels()
             try:
-                await kc.wait_for_ready(timeout=15.0)
+                await kc.wait_for_ready(timeout=wait_for_ready_timeout)
                 msg_id = kc.execute(code)
                 while True:
                     message = await get_iopub_msg_with_death_detection(kc, timeout=iopub_timeout)

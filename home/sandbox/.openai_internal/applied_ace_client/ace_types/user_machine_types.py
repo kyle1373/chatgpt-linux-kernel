@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Literal, Union
+from typing import Any, Literal
 
 import pydantic
 
@@ -18,9 +18,9 @@ class MethodCall(pydantic.BaseModel):
     object_reference: ObjectReference
     request_id: str
     method: str
-    args: List[Any]
+    args: list[Any]
                                                                                           
-    kwargs: Dict[str, Any]
+    kwargs: dict[str, Any]
 
 
 class MethodCallException(pydantic.BaseModel):
@@ -28,13 +28,13 @@ class MethodCallException(pydantic.BaseModel):
     request_id: str
     type: str
     value: str
-    traceback: List[str]
+    traceback: list[str]
 
 
 class MethodCallReturnValue(pydantic.BaseModel):
     message_type: Literal["call_return_value"] = "call_return_value"
     request_id: str
-    value: Any
+    value: Any = None
 
 
 class MethodCallObjectReferenceReturnValue(pydantic.BaseModel):
@@ -91,21 +91,18 @@ class RegisterActivityRequest(pydantic.BaseModel):
     kernel_id: str
 
 
-UserMachineRequest = Union[
-    MethodCall,
-    MethodCallException,
-    MethodCallReturnValue,
-    MethodCallObjectReferenceReturnValue,
-    RegisterActivityRequest,
-]
+UserMachineRequest = (
+    MethodCall
+    | MethodCallException
+    | MethodCallReturnValue
+    | MethodCallObjectReferenceReturnValue
+    | RegisterActivityRequest
+)
 
 
-UserMachineResponse = Union[
-    MethodCall,
-    MethodCallException,
-    MethodCallReturnValue,
-    MethodCallObjectReferenceReturnValue,
-]
+UserMachineResponse = (
+    MethodCall | MethodCallException | MethodCallReturnValue | MethodCallObjectReferenceReturnValue
+)
 
 
 class AceException(Exception):
@@ -114,3 +111,11 @@ class AceException(Exception):
 
 class UserMachineResponseTooLarge(AceException):
     pass
+
+
+def parse_raw_as_user_machine_request(s: str | bytes) -> UserMachineRequest:
+    return pydantic.TypeAdapter(UserMachineRequest).validate_json(s)                
+
+
+def parse_raw_as_user_machine_response(s: str | bytes) -> UserMachineResponse:
+    return pydantic.TypeAdapter(UserMachineResponse).validate_json(s)                

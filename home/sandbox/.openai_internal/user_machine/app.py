@@ -3,23 +3,19 @@ import inspect
 import json
 import logging
 import os
-import sys
 import time
 import traceback
 import urllib.parse
 import uuid
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional, Set
 
 import traitlets
-from ace_client.ace_types.user_machine_types import *
 from fastapi import (
     FastAPI,
     File,
     Form,
     HTTPException,
     Request,
-    Response,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
@@ -27,17 +23,36 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from jupyter_client import AsyncKernelClient, AsyncKernelManager, AsyncMultiKernelManager
-from pydantic import parse_obj_as
+from pydantic import TypeAdapter
 
-from . import routes, run_jupyter
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    format="[%(asctime)s.%(msecs)03d] [%(levelname)s] [%(name)s] %(message)s",
-    level=logging.INFO,
-    datefmt="%Y-%m-%d,%H:%M:%S",
-    stream=sys.stdout,
+from applied_ace_client.ace_types.user_machine_types import (
+    CheckFileResponse,
+    CreateKernelRequest,
+    CreateKernelResponse,
+    GetKernelStateResponse,
+    MethodCall,
+    MethodCallException,
+    MethodCallObjectReferenceReturnValue,
+    MethodCallReturnValue,
+    ObjectReference,
+    RegisterActivityRequest,
+    UploadFileRequest,
+    UserMachineRequest,
+    UserMachineResponseTooLarge,
 )
+
+from . import logger_utils, routes, run_jupyter
+
+logger_utils.init_logger_settings()
+logger = logging.getLogger(__name__)
+
+if os.getenv("ENVIRONMENT") in ("development", "staging"):
+                                                           
+                                                                           
+    logger.info(f"Setting log level to DEBUG for environment: {os.getenv('ENVIRONMENT')}")
+    logger.setLevel(logging.DEBUG)
+else:
+    logger.info(f"Keeping log level as INFO for environment: {os.getenv('ENVIRONMENT')}")
 
 os.chdir(os.path.expanduser("~"))
 
@@ -62,7 +77,7 @@ jupyter_config = traitlets.config.get_config()
 jupyter_config.KernelRestarter.restart_limit = 0
 _MULTI_KERNEL_MANAGER = AsyncMultiKernelManager(config=jupyter_config)
 
-_response_to_callback_from_kernel_futures: Dict[str, asyncio.Future] = {}
+_response_to_callback_from_kernel_futures: dict[str, asyncio.Future] = {}
 
 _timeout_at = {}
 _timeout = {}
@@ -83,13 +98,18 @@ _last_successful_health_check_monotonic_time = None
 _health_check_error = None
 _fill_kernel_queue_task_error = None
                                                                                              
-_HEALTH_CHECK_DELAY = 120
+_HEALTH_CHECK_DELAY = 300
                                                                                                
                        
-_HEALTH_CHECK_FAILURE_THRESHOLD = 180
+_HEALTH_CHECK_FAILURE_THRESHOLD = 600
 
                                             
-_KERNEL_CALLBACK_CONNECTION: Dict[str, Set[WebSocket]] = {}
+_KERNEL_CALLBACK_CONNECTION: dict[str, set[WebSocket]] = {}
+
+
+class ToolCallbackError(Exception):
+                                                                 
+    pass
 
 
 @dataclass
@@ -103,7 +123,7 @@ class AsyncKernelClientHolder:
                                                                                                      
                                                                                                                                                    
                                                                                  
-    value: Optional[AsyncKernelClient]
+    value: AsyncKernelClient | None
 
 
                                                                                          
@@ -141,7 +161,7 @@ async def _fill_kernel_queue():
                     logger.info(f"Deleting kernel {kernel_id}")
                     await _delete_kernel(kernel_id)
 
-            logger.info(f"Create new kernel for pool: Making new kernel")
+            logger.info("Create new kernel for pool: Making new kernel")
             start_time = time.monotonic()
 
             callback_id = str(uuid.uuid4())
@@ -154,7 +174,7 @@ async def _fill_kernel_queue():
                 kernel_manager = _MULTI_KERNEL_MANAGER.get_kernel(kernel_id)
                 client = kernel_manager.client()
                 client.start_channels()
-                await client.wait_for_ready(timeout=15.0)
+                await client.wait_for_ready(timeout=30.0)
                 client.stop_channels()
                 del client
             except Exception as e:
@@ -226,7 +246,7 @@ async def _forward_callback_from_kernel(call: MethodCall, request: Request):
 
     if call.object_reference.id not in _KERNEL_CALLBACK_CONNECTION:
         raise HTTPException(
-            status_code=400, detail=f"Unrecognized callback id {call.object_reference.id}"
+            status_code=404, detail=f"Unrecognized callback id {call.object_reference.id}"
         )
     conn = _KERNEL_CALLBACK_CONNECTION[call.object_reference.id]
     assert len(conn) != 0
@@ -236,11 +256,19 @@ async def _forward_callback_from_kernel(call: MethodCall, request: Request):
             detail=f"There are multiple websocket connections associated with callback id {call.object_reference.id}",
         )
 
-    await next(iter(conn)).send_text(call.json())
+    await next(iter(conn)).send_text(call.model_dump_json())
 
-    response = await _response_to_callback_from_kernel_futures[call.request_id]
-    logger.info(f"Forwarding callback response to kernel: {call.request_id}.")
-    del _response_to_callback_from_kernel_futures[call.request_id]
+    try:
+        response = await _response_to_callback_from_kernel_futures[call.request_id]
+    except ToolCallbackError as e:
+        logger.exception(f"Forwarding callback exception to kernel: {call.request_id}.")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        ) from e
+    finally:
+        del _response_to_callback_from_kernel_futures[call.request_id]
+
     return JSONResponse({"value": response})
 
 
@@ -250,6 +278,13 @@ app.include_router(routes.get_api_router(_forward_callback_from_kernel), prefix=
 def _respond_to_callback_from_kernel(response: MethodCallReturnValue):
     logger.info("Received callback response.")
     _response_to_callback_from_kernel_futures[response.request_id].set_result(response.value)
+
+
+def _respond_to_callback_exception_from_kernel(response: MethodCallException):
+    logger.info("Received callback exception.")
+    _response_to_callback_from_kernel_futures[response.request_id].set_exception(
+        ToolCallbackError(response.value)
+    )
 
 
 @app.get("/check_liveness")
@@ -266,7 +301,7 @@ async def _health_check_background():
     global _last_successful_health_check_monotonic_time, _health_check_error
     code = "print(f'{400+56}'); 100+23"
     while True:
-        logger.info("Health check: running...")
+        logger.debug("Health check: running...")
         start_time = time.monotonic()
         try:
             kernel_id = await _MULTI_KERNEL_MANAGER.start_kernel()
@@ -287,7 +322,7 @@ async def _health_check_background():
             finally:
                 await _MULTI_KERNEL_MANAGER.shutdown_kernel(kernel_id)
             end_time = time.monotonic()
-            logger.info(f"Health check: completed successfully in {end_time - start_time} seconds")
+            logger.debug(f"Health check: completed successfully in {end_time - start_time} seconds")
             _last_successful_health_check_monotonic_time = time.monotonic()
             _health_check_error = None
         except:
@@ -342,7 +377,7 @@ async def self_identify():
 @app.post("/upload")
 async def upload(upload_request: str = Form(), file: UploadFile = File()):
     logger.info("Upload request")
-    request = parse_obj_as(UploadFileRequest, json.loads(upload_request))
+    request = TypeAdapter(UploadFileRequest).validate_python(json.loads(upload_request))
     try:
         total_size = 0
         with open(request.destination, "wb") as f:
@@ -439,7 +474,7 @@ async def create_kernel(create_kernel_request: CreateKernelRequest):
 async def channel(websocket: WebSocket):
     await websocket.accept(headers=[(_SELF_IDENTIFY_HEADER_KEY_BYTES, _SELF_IDENTIFY_BYTES)])
 
-    clients: Dict[str, AsyncKernelClientHolder] = {}
+    clients: dict[str, AsyncKernelClientHolder] = {}
     registered_callback_ids = set()
                                       
                                                                
@@ -453,22 +488,26 @@ async def channel(websocket: WebSocket):
     recv_from_jupyter = None
     try:
         while True:
-            logger.info(f"Waiting for message. {recv_from_api_server}, {recv_from_jupyter}")
+            logger.debug(f"Waiting for message. {recv_from_api_server}, {recv_from_jupyter}")
             done, _ = await asyncio.wait(
                 [task for task in [recv_from_api_server, recv_from_jupyter] if task is not None],
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            logger.info(f"Got messages for {done}.")
+            logger.debug(f"Got messages for {done}.")
             if recv_from_api_server in done:
                 done_future = recv_from_api_server
                 recv_from_api_server = asyncio.create_task(websocket.receive_text())
-                request = parse_obj_as(UserMachineRequest, json.loads(done_future.result()))
-                logger.info(f"Received message from API server. {request}")
+                request = TypeAdapter(UserMachineRequest).validate_python(
+                    json.loads(done_future.result())
+                )
+                logger.debug(f"Received message from API server. {request}")
                 if isinstance(request, RegisterActivityRequest):
-                    logger.info(f"Registering activity. {request}")
+                    logger.debug(f"Registering activity. {request}")
                     _timeout_at[request.kernel_id] = time.monotonic() + _timeout[request.kernel_id]
                 elif isinstance(request, MethodCallReturnValue):
                     _respond_to_callback_from_kernel(request)
+                elif isinstance(request, MethodCallException):
+                    _respond_to_callback_exception_from_kernel(request)
                 elif isinstance(request, MethodCall):
 
                     async def run(request: UserMachineRequest):
@@ -482,10 +521,10 @@ async def channel(websocket: WebSocket):
                                 )
                                 callback_id = _kernel_callback_id[object_reference.id]
                                                                        
-                                logger.info("Setting callback forward function.")
+                                logger.debug("Setting callback forward function.")
                                 registered_callback_ids.add(callback_id)
                                 if callback_id not in _KERNEL_CALLBACK_CONNECTION:
-                                    _KERNEL_CALLBACK_CONNECTION[callback_id] = set([websocket])
+                                    _KERNEL_CALLBACK_CONNECTION[callback_id] = {websocket}
                                 else:
                                     _KERNEL_CALLBACK_CONNECTION[callback_id].add(websocket)
 
@@ -496,7 +535,7 @@ async def channel(websocket: WebSocket):
                                     f"Unknown object reference type: {object_reference.type}"
                                 )
                             qualified_method = f"{object_reference.type}.{request.method}"
-                            logger.info(
+                            logger.debug(
                                 f"Method call: {qualified_method} args: {request.args} kwargs: {request.kwargs}"
                             )
 
@@ -524,7 +563,7 @@ async def channel(websocket: WebSocket):
                 recv_from_jupyter = None
                 request_id, value, e = done_future.result()
                 if e is None:
-                    logger.info(f"Received result from Jupyter. {value}")
+                    logger.debug(f"Received result from Jupyter. {value}")
                     if isinstance(value, AsyncKernelClientHolder):
                         client_id = str(uuid.uuid4())
                         clients[client_id] = value
@@ -542,7 +581,7 @@ async def channel(websocket: WebSocket):
                     else:
                         result = MethodCallReturnValue(request_id=request_id, value=value)
                 else:
-                    logger.info(f"Received result from Jupyter. Exception: {value}")
+                    logger.debug(f"Received result from Jupyter. Exception: {value}")
                     result = MethodCallException(
                         request_id=request_id,
                         type=type(e).__name__,
@@ -553,8 +592,8 @@ async def channel(websocket: WebSocket):
                     del e
 
                                            
-                message = result.json()
-                logger.info(f"Sending response: {type(result)}, {len(message)}")
+                message = result.model_dump_json()
+                logger.debug(f"Sending response: {type(result)}, {len(message)}")
                 if len(message) > _MAX_JUPYTER_MESSAGE_SIZE:
                     logger.error(f"Response too large: {len(message)}")
                     e = UserMachineResponseTooLarge(
@@ -565,13 +604,13 @@ async def channel(websocket: WebSocket):
                         type=type(e).__name__,
                         value=str(e),
                         traceback=traceback.format_tb(e.__traceback__),
-                    ).json()
+                    ).model_dump_json()
 
                 await websocket.send_text(message)
-                logger.info("Response sent.")
+                logger.debug("Response sent.")
     except WebSocketDisconnect as e:
         if e.code == 1000:
-            logger.info("Client WebSocket connection closed normally")
+            logger.debug("Client WebSocket connection closed normally")
         else:
             logger.exception(f"Client WebSocket connection closed with code {e.code}")
     finally:
@@ -579,7 +618,7 @@ async def channel(websocket: WebSocket):
             for client in clients.values():
                 client.value.stop_channels()
                 client.value = None
-            logger.info("All client channels stopped.")
+            logger.debug("All client channels stopped.")
         except:
             logger.exception("Error while stopping client channels.")
 
