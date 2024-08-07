@@ -4,9 +4,10 @@ This is a repository containing all of the files that the chatgpt interface has 
 
 Directory progress:  
 
-`home`: 20% (need all directories other than `.openai_internal_contents`)  
+`home`: 100%  
 `mnt`: 100%  
 
+The following are directories which may not be interesting but might be worth checking out anyway:  
 `dev`: 0%  
 `sys`: 0%  
 `var`: 0%  
